@@ -28,4 +28,18 @@ public class SettlementController {
     public ApiResult<Settlement> byManifest(@PathVariable Long manifestId) {
         return ApiResult.ok(settlementService.getByManifest(manifestId));
     }
+
+    /** 额外费用单查询：费用来源明确（哪起拒收、谁承担、为什么），避免互相推责 */
+    @GetMapping("/fees")
+    public ApiResult<List<SettlementFee>> fees(@RequestParam(required = false) Long storeId,
+                                               @RequestParam(required = false) Long manifestId) {
+        AuthContext.require(ActorRole.MERCHANT, ActorRole.RECYCLER, ActorRole.REGULATOR);
+        if (manifestId != null) {
+            return ApiResult.ok(settlementService.listFeesByManifest(manifestId));
+        }
+        if (storeId != null) {
+            return ApiResult.ok(settlementService.listFeesByStore(storeId));
+        }
+        throw com.wasteoil.common.BizException.badRequest("storeId 与 manifestId 至少提供一个");
+    }
 }

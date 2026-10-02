@@ -13,6 +13,7 @@ import com.wasteoil.kafka.KafkaTopics;
 import com.wasteoil.manifest.Manifest;
 import com.wasteoil.manifest.ManifestRepository;
 import com.wasteoil.manifest.ManifestStatus;
+import com.wasteoil.rejection.RejectionService;
 import com.wasteoil.weighing.WeighingRecord;
 import com.wasteoil.weighing.WeighingRecordRepository;
 import org.springframework.stereotype.Service;
@@ -37,6 +38,7 @@ public class PlantService {
     private final ComplianceService complianceService;
     private final DispatchService dispatchService;
     private final ExceptionService exceptionService;
+    private final RejectionService rejectionService;
     private final EventPublisher eventPublisher;
 
     public PlantService(PlantReceiptRepository receiptRepository,
@@ -46,6 +48,7 @@ public class PlantService {
                         ComplianceService complianceService,
                         DispatchService dispatchService,
                         ExceptionService exceptionService,
+                        RejectionService rejectionService,
                         EventPublisher eventPublisher) {
         this.receiptRepository = receiptRepository;
         this.manifestRepository = manifestRepository;
@@ -54,6 +57,7 @@ public class PlantService {
         this.complianceService = complianceService;
         this.dispatchService = dispatchService;
         this.exceptionService = exceptionService;
+        this.rejectionService = rejectionService;
         this.eventPublisher = eventPublisher;
     }
 
@@ -63,7 +67,7 @@ public class PlantService {
      */
     @Transactional
     public PlantReceipt receive(Long manifestId, BigDecimal arrivalWeightKg, Integer barrelCount,
-                                String qualityCheck, String decision,
+                                String qualityCheck, String sealCheck, String decision,
                                 String rejectReason, String receivedBy) {
         Manifest manifest = manifestRepository.findById(manifestId)
                 .orElseThrow(() -> BizException.notFound("电子联单"));
@@ -83,13 +87,15 @@ public class PlantService {
         receipt.setArrivalWeightKg(arrivalWeightKg);
         receipt.setBarrelCount(barrelCount);
         receipt.setQualityCheck(qualityCheck);
+        receipt.setSealCheck(sealCheck == null || sealCheck.isBlank() ? "UNKNOWN" : sealCheck);
         receipt.setDecision(reject ? "REJECT" : "ACCEPT");
         receipt.setRejectReason(rejectReason);
         receipt.setReceivedBy(receivedBy);
         PlantReceipt saved = receiptRepository.save(receipt);
 
         if (reject) {
-            // 拒收：联单进入 REJECTED，登记异常由回收公司处置
+            // 拒收：联单进入 REJECTED，登记异常由回收公司处置，
+            // 同时自动建立拒收责任认定案（固化交接照片/封桶记录/轨迹/到厂检测证据快照）
             manifest.setStatus(ManifestStatus.REJECTED);
             manifest.setArrivalWeightKg(arrivalWeightKg);
             manifest.setBarrelCountArrival(barrelCount);
@@ -98,6 +104,7 @@ public class PlantService {
             manifestRepository.save(manifest);
             exceptionService.raise(ExceptionType.PLANT_REJECT, "MANIFEST", manifestId,
                     "处置厂拒收，原因: " + rejectReason);
+            rejectionService.createFor(manifest, saved);
         } else {
             // 接收：油桶到厂，执行合规闭环比对
             markBarrelsAtPlant(manifest);
@@ -112,6 +119,7 @@ public class PlantService {
         payload.put("arrivalWeightKg", arrivalWeightKg);
         payload.put("barrelCount", barrelCount);
         payload.put("qualityCheck", qualityCheck);
+        payload.put("sealCheck", saved.getSealCheck());
         payload.put("decision", saved.getDecision());
         eventPublisher.publish(KafkaTopics.MANIFEST_EVENTS,
                 "manifest-" + manifestId, "PlantReceiptRecorded", payload);

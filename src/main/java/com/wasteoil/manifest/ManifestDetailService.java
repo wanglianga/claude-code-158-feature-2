@@ -9,7 +9,11 @@ import com.wasteoil.exception.ExceptionTicket;
 import com.wasteoil.exception.ExceptionTicketRepository;
 import com.wasteoil.plant.PlantReceipt;
 import com.wasteoil.plant.PlantReceiptRepository;
+import com.wasteoil.rejection.RejectionCase;
+import com.wasteoil.rejection.RejectionCaseRepository;
 import com.wasteoil.settlement.Settlement;
+import com.wasteoil.settlement.SettlementFee;
+import com.wasteoil.settlement.SettlementFeeRepository;
 import com.wasteoil.settlement.SettlementRepository;
 import com.wasteoil.track.TrackPoint;
 import com.wasteoil.track.TrackPointRepository;
@@ -34,6 +38,8 @@ public class ManifestDetailService {
     private final TrackPointRepository trackPointRepository;
     private final PlantReceiptRepository receiptRepository;
     private final SettlementRepository settlementRepository;
+    private final SettlementFeeRepository settlementFeeRepository;
+    private final RejectionCaseRepository rejectionCaseRepository;
     private final ExceptionTicketRepository ticketRepository;
 
     public ManifestDetailService(ManifestRepository manifestRepository,
@@ -43,6 +49,8 @@ public class ManifestDetailService {
                                  TrackPointRepository trackPointRepository,
                                  PlantReceiptRepository receiptRepository,
                                  SettlementRepository settlementRepository,
+                                 SettlementFeeRepository settlementFeeRepository,
+                                 RejectionCaseRepository rejectionCaseRepository,
                                  ExceptionTicketRepository ticketRepository) {
         this.manifestRepository = manifestRepository;
         this.dispatchRepository = dispatchRepository;
@@ -51,6 +59,8 @@ public class ManifestDetailService {
         this.trackPointRepository = trackPointRepository;
         this.receiptRepository = receiptRepository;
         this.settlementRepository = settlementRepository;
+        this.settlementFeeRepository = settlementFeeRepository;
+        this.rejectionCaseRepository = rejectionCaseRepository;
         this.ticketRepository = ticketRepository;
     }
 
@@ -66,13 +76,16 @@ public class ManifestDetailService {
                 : trackPointRepository.findByDispatchIdOrderByRecordedAtAsc(dispatch.getId());
         PlantReceipt receipt = receiptRepository.findByManifestId(manifestId).orElse(null);
         Settlement settlement = settlementRepository.findByManifestId(manifestId).orElse(null);
+        List<SettlementFee> settlementFees = settlementFeeRepository.findByManifestId(manifestId);
+        RejectionCase rejectionCase = rejectionCaseRepository.findByManifestId(manifestId).orElse(null);
         List<ExceptionTicket> exceptions = ticketRepository.findByRefTypeAndRefId("MANIFEST", manifestId);
         return new ManifestDetail(manifest, appointment, dispatch, weighings, tracks,
-                receipt, settlement, exceptions);
+                receipt, settlement, settlementFees, rejectionCase, exceptions);
     }
 
     /**
-     * 联单全链路详情：预约、派单、称重、轨迹、收料、结算、异常，一份数据各方共用。
+     * 联单全链路详情：预约、派单、称重、轨迹、收料、结算、额外费用、拒收认定、异常，
+     * 一份数据各方共用。
      */
     public record ManifestDetail(
             Manifest manifest,
@@ -82,6 +95,8 @@ public class ManifestDetailService {
             List<TrackPoint> tracks,
             PlantReceipt receipt,
             Settlement settlement,
+            List<SettlementFee> settlementFees,
+            RejectionCase rejectionCase,
             List<ExceptionTicket> exceptions) {
     }
 }

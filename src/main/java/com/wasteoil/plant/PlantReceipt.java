@@ -35,6 +35,10 @@ public class PlantReceipt {
     @Column(name = "quality_check", nullable = false)
     private String qualityCheck;
 
+    /** 到厂封条核验：INTACT 完好 / BROKEN 破损 / UNKNOWN 未核验 */
+    @Column(name = "seal_check", nullable = false)
+    private String sealCheck = "UNKNOWN";
+
     /** ACCEPT / REJECT */
     @Column(nullable = false)
     private String decision;

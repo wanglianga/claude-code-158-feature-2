@@ -94,14 +94,17 @@ for m in json.load(sys.stdin)['data']:
     if m['dispatchId']==$DID3: print(m['id']); break")
 check "联单记录补录 1 条" "$(jget "['data']['manifest']['manualWeighCount']" <<< "$(req GET /api/manifests/$MID3 REGULATOR regulator-1)")" "1"
 
-echo "=== 6. 处置厂拒收（混入厨余） ==="
+echo "=== 6. 处置厂拒收（混入厨余）→ 责任判断 → 额外费用 → 返运二次处理 ==="
 curl -s -X POST "$BASE/api/weighings/devices/DEV-002/heartbeat" -H "X-Role: RECYCLER" >/dev/null
 AID4=$(jget "['data']['id']" <<< "$(req POST /api/appointments MERCHANT merchant-1 "{\"storeId\":2,\"barrelCount\":1,\"estimatedWeightKg\":100,\"windowStart\":\"$WS\",\"windowEnd\":\"$WE\"}")")
 DID4=$(jget "['data']['id']" <<< "$(req POST /api/dispatches RECYCLER recycler-1 "{\"appointmentId\":$AID4,\"vehicleId\":1,\"driverId\":1,\"plantId\":1,\"plannedStart\":\"$WS\",\"plannedEnd\":\"$WE\"}")")
 req POST /api/dispatches/$DID4/depart DRIVER driver-1 '{}' >/dev/null
 req POST /api/dispatches/$DID4/arrive DRIVER driver-1 '{}' >/dev/null
-req POST /api/dispatches/$DID4/verify DRIVER driver-1 '{"storeQr":"STORE-QR-2","deviceCode":"DEV-002","handoverName":"陈店长"}' >/dev/null
-req POST /api/weighings DRIVER driver-1 "{\"dispatchId\":$DID4,\"barrelCode\":\"BAR-101\",\"weightKg\":100,\"deviceCode\":\"DEV-002\",\"source\":\"DEVICE\"}" >/dev/null
+req POST /api/dispatches/$DID4/verify DRIVER driver-1 '{"storeQr":"STORE-QR-2","deviceCode":"DEV-002","handoverName":"陈店长","photoUrls":"https://img.example.com/handover101.jpg"}' >/dev/null
+req POST /api/weighings DRIVER driver-1 "{\"dispatchId\":$DID4,\"barrelCode\":\"BAR-101\",\"weightKg\":100,\"deviceCode\":\"DEV-002\",\"source\":\"DEVICE\",\"photoUrl\":\"https://img.example.com/w101.jpg\"}" >/dev/null
+# 司机封桶：留封条编号与加封照片
+SEAL=$(req POST /api/dispatches/$DID4/seals DRIVER driver-1 '{"barrelCode":"BAR-101","sealNo":"SEAL-101-A","photoUrl":"https://img.example.com/seal101.jpg"}')
+check "封桶记录已登记" "$(jget "['data']['sealNo']" <<< "$SEAL")" "SEAL-101-A"
 req POST /api/dispatches/$DID4/load-complete DRIVER driver-1 '{}' >/dev/null
 req POST /api/tracks/$DID4 DRIVER driver-1 '{"points":[{"lat":30.65,"lng":104.05}]}' >/dev/null
 req POST /api/dispatches/$DID4/arrive-plant DRIVER driver-1 '{}' >/dev/null
@@ -109,8 +112,63 @@ MID4=$(curl -s "$BASE/api/manifests" -H "X-Role: REGULATOR" | python3 -c "
 import sys,json
 for m in json.load(sys.stdin)['data']:
     if m['dispatchId']==$DID4: print(m['id']); break")
-req POST /api/receipts PLANT plant-1 "{\"manifestId\":$MID4,\"arrivalWeightKg\":100,\"barrelCount\":1,\"qualityCheck\":\"CONTAMINATED\",\"decision\":\"REJECT\",\"rejectReason\":\"混入大量厨余垃圾\",\"receivedBy\":\"厂验收员\"}" >/dev/null
+req POST /api/receipts PLANT plant-1 "{\"manifestId\":$MID4,\"arrivalWeightKg\":100,\"barrelCount\":1,\"qualityCheck\":\"CONTAMINATED\",\"sealCheck\":\"INTACT\",\"decision\":\"REJECT\",\"rejectReason\":\"混入大量厨余残渣\",\"receivedBy\":\"厂验收员\"}" >/dev/null
 check "联单 REJECTED" "$(jget "['data']['manifest']['status']" <<< "$(req GET /api/manifests/$MID4 REGULATOR regulator-1)")" "REJECTED"
+
+echo "=== 6a. 拒收责任判断：证据追溯 → 商户源头混入 → 商户承担额外处理费 ==="
+CASE=$(req GET /api/rejections/by-manifest/$MID4 REGULATOR regulator-1)
+CASEID=$(jget "['data']['rejectionCase']['id']" <<< "$CASE")
+check "拒收案件自动建立(待定责)" "$(jget "['data']['rejectionCase']['status']" <<< "$CASE")" "PENDING_REVIEW"
+check "系统建议商户源头混入" "$(jget "['data']['rejectionCase']['suggestedLiability']" <<< "$CASE")" "MERCHANT_SOURCE"
+check "证据含封桶记录1条" "$(jget "['data']['evidence']['sealedBarrelCount']" <<< "$CASE")" "1"
+check "证据含交接照片" "$(python3 -c "import sys,json;print(len(json.load(sys.stdin)['data']['evidence']['handoverPhotos'])>=1)" <<< "$CASE")" "True"
+check "证据含到厂封条核验" "$(jget "['data']['evidence']['arrivalSealCheck']" <<< "$CASE")" "INTACT"
+CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$BASE/api/rejections/$CASEID/determine" -H "X-Role: RECYCLER" -H "Content-Type: application/json" -d '{"liabilityParty":"MERCHANT_SOURCE","extraFeeAmount":200}')
+check "定责无说明被拒(400)" "$CODE" "400"
+DET=$(req POST /api/rejections/$CASEID/determine RECYCLER recycler-1 '{"liabilityParty":"MERCHANT_SOURCE","note":"封条完好且交接照片可见残渣，判定商户源头混入","extraFeeAmount":200}')
+check "定责后案件 DETERMINED" "$(jget "['data']['status']" <<< "$DET")" "DETERMINED"
+check "费用承担方为商户" "$(jget "['data']['feeBearer']" <<< "$DET")" "MERCHANT"
+FEE=$(req GET "/api/settlements/fees?manifestId=$MID4" MERCHANT merchant-1)
+check "费用单金额 200 元" "$(jget "['data'][0]['amount']" <<< "$FEE")" "200.0"
+check "费用来源写明商户源头混入" "$(python3 -c "import sys,json;print('商户源头混入' in json.load(sys.stdin)['data'][0]['sourceNote'])" <<< "$FEE")" "True"
+check "联单详情含拒收案件" "$(jget "['data']['rejectionCase']['id']" <<< "$(req GET /api/manifests/$MID4 REGULATOR regulator-1)")" "$CASEID"
+
+echo "=== 6b. 返运 → 临时存放 → 二次处理 → 结案 ==="
+RET=$(req POST /api/rejections/$CASEID/return RECYCLER recycler-1 '{"returnRoute":"处置厂→经开区暂存点→二次处理车间","tempStoragePoint":"经开区环保园暂存仓A-3"}')
+check "返运登记(路线+存放点)后 RETURNING" "$(jget "['data']['status']" <<< "$RET")" "RETURNING"
+REP=$(req POST /api/rejections/$CASEID/reprocess RECYCLER recycler-1 '{"secondaryResult":"厨余残渣分离后二次处置完成，产出工业原料油82kg"}')
+check "二次处理结果登记后 REPROCESSED" "$(jget "['data']['status']" <<< "$REP")" "REPROCESSED"
+check "结案 CLOSED" "$(jget "['data']['status']" <<< "$(req POST /api/rejections/$CASEID/close RECYCLER recycler-1 '{}')")" "CLOSED"
+TICKET=$(req GET "/api/exceptions/by-ref?refType=MANIFEST&refId=$MID4" RECYCLER recycler-1 | python3 -c "
+import sys,json
+for t in json.load(sys.stdin)['data']:
+    if t['type']=='PLANT_REJECT': print(t['status']); break")
+check "结案后拒收工单联动处理" "$TICKET" "RESOLVED"
+
+echo "=== 6c. 运输中污染：未留封桶记录 → 司机与车队担责 ==="
+curl -s -X POST "$BASE/api/weighings/devices/DEV-003/heartbeat" -H "X-Role: RECYCLER" >/dev/null
+AID4B=$(jget "['data']['id']" <<< "$(req POST /api/appointments MERCHANT merchant-2 "{\"storeId\":3,\"barrelCount\":1,\"estimatedWeightKg\":100,\"windowStart\":\"$WS\",\"windowEnd\":\"$WE\"}")")
+DID4B=$(jget "['data']['id']" <<< "$(req POST /api/dispatches RECYCLER recycler-1 "{\"appointmentId\":$AID4B,\"vehicleId\":1,\"driverId\":1,\"plantId\":1,\"plannedStart\":\"$WS\",\"plannedEnd\":\"$WE\"}")")
+req POST /api/dispatches/$DID4B/depart DRIVER driver-1 '{}' >/dev/null
+req POST /api/dispatches/$DID4B/arrive DRIVER driver-1 '{}' >/dev/null
+req POST /api/dispatches/$DID4B/verify DRIVER driver-1 '{"storeQr":"STORE-QR-3","deviceCode":"DEV-003","handoverName":"刘老板"}' >/dev/null
+req POST /api/weighings DRIVER driver-1 "{\"dispatchId\":$DID4B,\"barrelCode\":\"BAR-201\",\"weightKg\":100,\"deviceCode\":\"DEV-003\",\"source\":\"DEVICE\"}" >/dev/null
+req POST /api/dispatches/$DID4B/load-complete DRIVER driver-1 '{}' >/dev/null
+req POST /api/tracks/$DID4B DRIVER driver-1 '{"points":[{"lat":30.61,"lng":104.03}]}' >/dev/null
+req POST /api/dispatches/$DID4B/arrive-plant DRIVER driver-1 '{}' >/dev/null
+MID4B=$(curl -s "$BASE/api/manifests" -H "X-Role: REGULATOR" | python3 -c "
+import sys,json
+for m in json.load(sys.stdin)['data']:
+    if m['dispatchId']==$DID4B: print(m['id']); break")
+req POST /api/receipts PLANT plant-1 "{\"manifestId\":$MID4B,\"arrivalWeightKg\":100,\"barrelCount\":1,\"qualityCheck\":\"CONTAMINATED\",\"decision\":\"REJECT\",\"rejectReason\":\"混入厨余，运输环节无法自证\",\"receivedBy\":\"厂验收员\"}" >/dev/null
+CASEB=$(req GET /api/rejections/by-manifest/$MID4B REGULATOR regulator-1)
+CASEIDB=$(jget "['data']['rejectionCase']['id']" <<< "$CASEB")
+check "未封桶建议运输中污染" "$(jget "['data']['rejectionCase']['suggestedLiability']" <<< "$CASEB")" "TRANSPORT"
+DETB=$(req POST /api/rejections/$CASEIDB/determine RECYCLER recycler-1 '{"liabilityParty":"TRANSPORT","note":"未留封桶记录，运输环节无法自证清白","extraFeeAmount":300}')
+check "费用承担方为司机与车队" "$(jget "['data']['feeBearer']" <<< "$DETB")" "FLEET"
+FEEB=$(req GET "/api/settlements/fees?manifestId=$MID4B" RECYCLER recycler-1)
+check "费用单记录责任司机" "$(jget "['data'][0]['bearerDriverId']" <<< "$FEEB")" "1"
+check "无需返运直接结案" "$(jget "['data']['status']" <<< "$(req POST /api/rejections/$CASEIDB/close RECYCLER recycler-1 '{}')")" "CLOSED"
 
 echo "=== 7. 运输损耗异常 → 阻断闭环 → 处理后恢复 ==="
 AID5=$(jget "['data']['id']" <<< "$(req POST /api/appointments MERCHANT merchant-1 "{\"storeId\":2,\"barrelCount\":1,\"estimatedWeightKg\":100,\"windowStart\":\"$WS\",\"windowEnd\":\"$WE\"}")")

@@ -43,4 +43,9 @@ public class KafkaConfig {
     public NewTopic complianceEvents() {
         return TopicBuilder.name(KafkaTopics.COMPLIANCE_EVENTS).partitions(3).replicas(1).build();
     }
+
+    @Bean
+    public NewTopic rejectionEvents() {
+        return TopicBuilder.name(KafkaTopics.REJECTION_EVENTS).partitions(3).replicas(1).build();
+    }
 }

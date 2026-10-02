@@ -19,11 +19,14 @@ import java.util.List;
 public class SettlementService {
 
     private final SettlementRepository settlementRepository;
+    private final SettlementFeeRepository settlementFeeRepository;
     private final WasteOilProperties properties;
 
     public SettlementService(SettlementRepository settlementRepository,
+                             SettlementFeeRepository settlementFeeRepository,
                              WasteOilProperties properties) {
         this.settlementRepository = settlementRepository;
+        this.settlementFeeRepository = settlementFeeRepository;
         this.properties = properties;
     }
 
@@ -77,5 +80,17 @@ public class SettlementService {
     @Transactional(readOnly = true)
     public List<Settlement> listByStore(Long storeId) {
         return settlementRepository.findByStoreIdOrderByCreatedAtDesc(storeId);
+    }
+
+    /** 门店的额外费用单（费用来源留痕） */
+    @Transactional(readOnly = true)
+    public List<SettlementFee> listFeesByStore(Long storeId) {
+        return settlementFeeRepository.findByStoreIdOrderByCreatedAtDesc(storeId);
+    }
+
+    /** 联单的额外费用单 */
+    @Transactional(readOnly = true)
+    public List<SettlementFee> listFeesByManifest(Long manifestId) {
+        return settlementFeeRepository.findByManifestId(manifestId);
     }
 }

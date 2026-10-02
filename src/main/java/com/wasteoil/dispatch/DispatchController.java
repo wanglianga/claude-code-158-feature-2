@@ -52,6 +52,20 @@ public class DispatchController {
                 req.handoverName(), req.photoUrls()));
     }
 
+    /** 司机封桶：装车后逐桶加封并留存封条编号与照片 */
+    @PostMapping("/{id}/seals")
+    public ApiResult<BarrelSeal> seal(@PathVariable Long id,
+                                      @Valid @RequestBody SealRequest req) {
+        AuthContext.require(ActorRole.DRIVER, ActorRole.RECYCLER);
+        return ApiResult.ok(dispatchService.sealBarrel(id, req.barrelCode(), req.sealNo(), req.photoUrl()));
+    }
+
+    /** 本趟封桶记录查询 */
+    @GetMapping("/{id}/seals")
+    public ApiResult<List<BarrelSeal>> seals(@PathVariable Long id) {
+        return ApiResult.ok(dispatchService.listSeals(id));
+    }
+
     /** 装车完成起运 */
     @PostMapping("/{id}/load-complete")
     public ApiResult<DispatchOrder> loadComplete(@PathVariable Long id) {
@@ -91,5 +105,11 @@ public class DispatchController {
             String deviceCode,
             @NotBlank(message = "交接人不能为空") String handoverName,
             String photoUrls) {
+    }
+
+    public record SealRequest(
+            @NotBlank(message = "油桶编号不能为空") String barrelCode,
+            @NotBlank(message = "封条编号不能为空") String sealNo,
+            String photoUrl) {
     }
 }

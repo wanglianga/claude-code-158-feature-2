@@ -13,6 +13,7 @@ public final class KafkaTopics {
     public static final String MANIFEST_EVENTS = "wasteoil.manifest.events";
     public static final String EXCEPTION_EVENTS = "wasteoil.exception.events";
     public static final String COMPLIANCE_EVENTS = "wasteoil.compliance.events";
+    public static final String REJECTION_EVENTS = "wasteoil.rejection.events";
 
     private KafkaTopics() {
     }

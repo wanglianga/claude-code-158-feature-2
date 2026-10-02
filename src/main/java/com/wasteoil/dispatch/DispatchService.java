@@ -3,6 +3,8 @@ package com.wasteoil.dispatch;
 import com.wasteoil.appointment.Appointment;
 import com.wasteoil.appointment.AppointmentRepository;
 import com.wasteoil.appointment.AppointmentStatus;
+import com.wasteoil.barrel.Barrel;
+import com.wasteoil.barrel.BarrelRepository;
 import com.wasteoil.common.AuthContext;
 import com.wasteoil.common.BizException;
 import com.wasteoil.config.WasteOilProperties;
@@ -51,6 +53,8 @@ public class DispatchService {
     private final WeighingRecordRepository weighingRecordRepository;
     private final WeighingDeviceRepository weighingDeviceRepository;
     private final PickupVerificationRepository verificationRepository;
+    private final BarrelRepository barrelRepository;
+    private final BarrelSealRepository barrelSealRepository;
     private final DispatchPlanner planner;
     private final ExceptionService exceptionService;
     private final EventPublisher eventPublisher;
@@ -68,6 +72,8 @@ public class DispatchService {
                            WeighingRecordRepository weighingRecordRepository,
                            WeighingDeviceRepository weighingDeviceRepository,
                            PickupVerificationRepository verificationRepository,
+                           BarrelRepository barrelRepository,
+                           BarrelSealRepository barrelSealRepository,
                            DispatchPlanner planner,
                            ExceptionService exceptionService,
                            EventPublisher eventPublisher,
@@ -84,6 +90,8 @@ public class DispatchService {
         this.weighingRecordRepository = weighingRecordRepository;
         this.weighingDeviceRepository = weighingDeviceRepository;
         this.verificationRepository = verificationRepository;
+        this.barrelRepository = barrelRepository;
+        this.barrelSealRepository = barrelSealRepository;
         this.planner = planner;
         this.exceptionService = exceptionService;
         this.eventPublisher = eventPublisher;
@@ -217,6 +225,54 @@ public class DispatchService {
         DispatchOrder saved = dispatchRepository.save(dispatch);
         publish(saved, "DispatchVerified");
         return saved;
+    }
+
+    /**
+     * 司机封桶：装车称重后逐桶加封，登记封条编号与照片。
+     * 封桶记录是处置厂拒收后划分责任的关键证据。
+     */
+    @Transactional
+    public BarrelSeal sealBarrel(Long dispatchId, String barrelCode, String sealNo, String photoUrl) {
+        DispatchOrder dispatch = getAndCheckDriver(dispatchId);
+        if (dispatch.getStatus() != DispatchStatus.LOADING
+                && dispatch.getStatus() != DispatchStatus.IN_TRANSIT) {
+            throw BizException.conflict("派单状态为 " + dispatch.getStatus() + "，不能封桶");
+        }
+        Appointment appointment = appointmentRepository.findById(dispatch.getAppointmentId())
+                .orElseThrow(() -> BizException.notFound("预约"));
+        Barrel barrel = barrelRepository.findByCode(barrelCode)
+                .orElseThrow(() -> BizException.notFound("油桶: " + barrelCode));
+        if (!barrel.getStoreId().equals(appointment.getStoreId())) {
+            throw BizException.badRequest("油桶 " + barrelCode + " 不属于本次回收门店");
+        }
+        if (!weighingRecordRepository.existsByDispatchIdAndBarrelId(dispatchId, barrel.getId())) {
+            throw BizException.conflict("油桶 " + barrelCode + " 本趟尚未称重装车，不能封桶");
+        }
+        if (barrelSealRepository.existsByDispatchIdAndBarrelId(dispatchId, barrel.getId())) {
+            throw BizException.conflict("油桶 " + barrelCode + " 本趟已加封，不能重复");
+        }
+
+        BarrelSeal seal = new BarrelSeal();
+        seal.setDispatchId(dispatchId);
+        seal.setBarrelId(barrel.getId());
+        seal.setSealNo(sealNo);
+        seal.setPhotoUrl(photoUrl);
+        seal.setSealedBy(AuthContext.accountId() == null ? "driver" : AuthContext.accountId());
+        BarrelSeal saved = barrelSealRepository.save(seal);
+
+        Map<String, Object> payload = new HashMap<>();
+        payload.put("dispatchId", dispatchId);
+        payload.put("barrelCode", barrelCode);
+        payload.put("sealNo", sealNo);
+        payload.put("sealedBy", saved.getSealedBy());
+        eventPublisher.publish(KafkaTopics.DISPATCH_EVENTS, "dispatch-" + dispatchId,
+                "BarrelSealed", payload);
+        return saved;
+    }
+
+    @Transactional(readOnly = true)
+    public List<BarrelSeal> listSeals(Long dispatchId) {
+        return barrelSealRepository.findByDispatchId(dispatchId);
     }
 
     /** 装车完成起运：要求至少有一条称重记录。联单进入 IN_TRANSIT。 */

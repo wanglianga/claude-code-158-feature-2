@@ -3,14 +3,17 @@ package com.wasteoil;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.wasteoil.audit.AuditLogRepository;
+import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.MethodOrderer;
 import org.junit.jupiter.api.Order;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.TestInstance;
 import org.junit.jupiter.api.TestMethodOrder;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.http.MediaType;
+import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.kafka.test.context.EmbeddedKafka;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.web.servlet.MockMvc;
@@ -38,6 +41,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 @EmbeddedKafka(partitions = 1)
 @ActiveProfiles("test")
 @TestMethodOrder(MethodOrderer.OrderAnnotation.class)
+@TestInstance(TestInstance.Lifecycle.PER_CLASS)
 class EndToEndIntegrationTest {
 
     private static final ZoneId ZONE = ZoneId.of("Asia/Shanghai");
@@ -48,10 +52,29 @@ class EndToEndIntegrationTest {
     ObjectMapper om;
     @Autowired
     AuditLogRepository auditLogRepository;
+    @Autowired
+    JdbcTemplate jdbcTemplate;
 
     // 跨用例共享的主流程产物
     static long happyManifestId;
     static long happyDispatchId;
+
+    /**
+     * 清理上一轮运行遗留的业务数据并恢复种子状态（油桶回门店、设备在线），
+     * 保证测试在持久化测试库上可以重复执行。
+     */
+    @BeforeAll
+    void resetDatabase() {
+        jdbcTemplate.execute("""
+                TRUNCATE settlement_fees, rejection_cases, barrel_seals, settlements,
+                         inspections, disputes, exception_tickets, plant_receipts,
+                         track_points, pickup_verifications, weighing_records,
+                         manifests, dispatch_orders, appointments, risk_entries, audit_logs
+                RESTART IDENTITY CASCADE
+                """);
+        jdbcTemplate.update("UPDATE barrels SET status = 'AT_STORE'");
+        jdbcTemplate.update("UPDATE weighing_devices SET status = 'ONLINE', last_heartbeat_at = now()");
+    }
 
     // ---------- 工具方法 ----------
 
@@ -374,6 +397,163 @@ class EndToEndIntegrationTest {
 
         JsonNode closed = getJson("/api/manifests/" + manifestId, "REGULATOR", 200);
         assertThat(closed.path("data").path("manifest").path("status").asText()).isEqualTo("CLOSED");
+    }
+
+    // ---------- 拒收后责任判断 ----------
+
+    @Test
+    @Order(14)
+    void 拒收定责_商户源头混入_收取额外处理费并返运() throws Exception {
+        postJson("/api/weighings/devices/DEV-003/heartbeat", "RECYCLER", "recycler-1", "{}", 200);
+        long appointmentId = createAppointment(3, 1, "100");
+        long dispatchId = planDispatch(appointmentId, tomorrowAt(10, 0), tomorrowAt(11, 0));
+        arriveAndVerify(dispatchId, "STORE-QR-3", "DEV-003");
+
+        // 未称重先封桶 → 409
+        postJson("/api/dispatches/" + dispatchId + "/seals", "DRIVER", "driver-1", """
+                {"barrelCode": "BAR-201", "sealNo": "SEAL-201-A"}
+                """, 409);
+
+        // 称重（留现场照片）→ 封桶（留加封照片）
+        postJson("/api/weighings", "DRIVER", "driver-1", """
+                {"dispatchId": %d, "barrelCode": "BAR-201", "weightKg": 100, "deviceCode": "DEV-003",
+                 "source": "DEVICE", "photoUrl": "https://img.example.com/w201.jpg", "handoverName": "刘老板"}
+                """.formatted(dispatchId), 200);
+        postJson("/api/dispatches/" + dispatchId + "/seals", "DRIVER", "driver-1", """
+                {"barrelCode": "BAR-201", "sealNo": "SEAL-201-A", "photoUrl": "https://img.example.com/seal201.jpg"}
+                """, 200);
+        JsonNode seals = getJson("/api/dispatches/" + dispatchId + "/seals", "DRIVER", 200);
+        assertThat(seals.path("data").size()).isEqualTo(1);
+
+        postJson("/api/dispatches/" + dispatchId + "/load-complete", "DRIVER", "driver-1", "{}", 200);
+        uploadTracksAndArrivePlant(dispatchId);
+        long manifestId = manifestIdOf(dispatchId);
+
+        // 处置厂拒收：混入厨余残渣，到厂封条完好
+        postJson("/api/receipts", "PLANT", "plant-1", """
+                {"manifestId": %d, "arrivalWeightKg": 100, "barrelCount": 1,
+                 "qualityCheck": "CONTAMINATED", "sealCheck": "INTACT", "decision": "REJECT",
+                 "rejectReason": "混入大量厨余残渣", "receivedBy": "厂验收员"}
+                """.formatted(manifestId), 200);
+
+        // 拒收案件自动建立：证据快照齐备（交接照片/封桶记录/轨迹/到厂检测），系统建议商户源头
+        JsonNode caseResp = getJson("/api/rejections/by-manifest/" + manifestId, "REGULATOR", 200);
+        JsonNode rejectionCase = caseResp.path("data").path("rejectionCase");
+        long caseId = rejectionCase.path("id").asLong();
+        assertThat(rejectionCase.path("status").asText()).isEqualTo("PENDING_REVIEW");
+        assertThat(rejectionCase.path("suggestedLiability").asText()).isEqualTo("MERCHANT_SOURCE");
+        JsonNode evidence = caseResp.path("data").path("evidence");
+        assertThat(evidence.path("weighedBarrelCount").asInt()).isEqualTo(1);
+        assertThat(evidence.path("sealedBarrelCount").asInt()).isEqualTo(1);
+        assertThat(evidence.path("trackPointCount").asInt()).isEqualTo(2);
+        assertThat(evidence.path("arrivalSealCheck").asText()).isEqualTo("INTACT");
+        assertThat(evidence.path("handoverPhotos").size()).isGreaterThanOrEqualTo(1);
+        assertThat(evidence.path("sealRecords").get(0).path("sealNo").asText()).isEqualTo("SEAL-201-A");
+
+        // 定责说明必填；商户无权定责
+        postJson("/api/rejections/" + caseId + "/determine", "RECYCLER", "recycler-1", """
+                {"liabilityParty": "MERCHANT_SOURCE", "extraFeeAmount": 200}
+                """, 400);
+        postJson("/api/rejections/" + caseId + "/determine", "MERCHANT", "merchant-1", """
+                {"liabilityParty": "MERCHANT_SOURCE", "note": "x", "extraFeeAmount": 200}
+                """, 403);
+
+        // 定责：商户源头混入，回收公司收取额外处理费 200 元
+        JsonNode determined = postJson("/api/rejections/" + caseId + "/determine", "RECYCLER", "recycler-1", """
+                {"liabilityParty": "MERCHANT_SOURCE", "note": "封条完好且交接照片可见残渣，判定商户源头混入",
+                 "extraFeeAmount": 200}
+                """, 200);
+        assertThat(determined.path("data").path("status").asText()).isEqualTo("DETERMINED");
+        assertThat(determined.path("data").path("feeBearer").asText()).isEqualTo("MERCHANT");
+
+        // 结算费用单：费用来源明确（哪起拒收、谁承担、为什么）
+        JsonNode fees = getJson("/api/settlements/fees?manifestId=" + manifestId, "MERCHANT", 200);
+        assertThat(fees.path("data").size()).isEqualTo(1);
+        JsonNode fee = fees.path("data").get(0);
+        assertThat(fee.path("bearer").asText()).isEqualTo("MERCHANT");
+        assertThat(fee.path("amount").asDouble()).isEqualTo(200.0);
+        assertThat(fee.path("sourceNote").asText()).contains("商户源头混入");
+
+        // 联单详情可见拒收案件与费用（各端同一口径）
+        JsonNode detail = getJson("/api/manifests/" + manifestId, "REGULATOR", 200);
+        assertThat(detail.path("data").path("rejectionCase").path("id").asLong()).isEqualTo(caseId);
+        assertThat(detail.path("data").path("settlementFees").size()).isEqualTo(1);
+
+        // 返运：记录返运路线与临时存放点 → 二次处理结果 → 结案
+        JsonNode returning = postJson("/api/rejections/" + caseId + "/return", "RECYCLER", "recycler-1", """
+                {"returnRoute": "处置厂→经开区暂存点→二次处理车间", "tempStoragePoint": "经开区环保园暂存仓 A-3"}
+                """, 200);
+        assertThat(returning.path("data").path("status").asText()).isEqualTo("RETURNING");
+        assertThat(returning.path("data").path("returnRoute").asText()).contains("暂存点");
+        JsonNode reprocessed = postJson("/api/rejections/" + caseId + "/reprocess", "RECYCLER", "recycler-1", """
+                {"secondaryResult": "厨余残渣分离后二次处置完成，产出工业原料油 82kg"}
+                """, 200);
+        assertThat(reprocessed.path("data").path("status").asText()).isEqualTo("REPROCESSED");
+        JsonNode closed = postJson("/api/rejections/" + caseId + "/close", "RECYCLER", "recycler-1", "{}", 200);
+        assertThat(closed.path("data").path("status").asText()).isEqualTo("CLOSED");
+
+        // 结案后拒收异常工单联动处理完毕
+        JsonNode tickets = getJson("/api/exceptions/by-ref?refType=MANIFEST&refId=" + manifestId,
+                "RECYCLER", 200);
+        boolean rejectResolved = false;
+        for (JsonNode t : tickets.path("data")) {
+            if ("PLANT_REJECT".equals(t.path("type").asText())
+                    && "RESOLVED".equals(t.path("status").asText())) {
+                rejectResolved = true;
+            }
+        }
+        assertThat(rejectResolved).isTrue();
+    }
+
+    @Test
+    @Order(15)
+    void 拒收定责_运输中污染_司机车队担责() throws Exception {
+        postJson("/api/weighings/devices/DEV-003/heartbeat", "RECYCLER", "recycler-1", "{}", 200);
+        long appointmentId = createAppointment(3, 1, "100");
+        long dispatchId = planDispatch(appointmentId, tomorrowAt(10, 0), tomorrowAt(11, 0));
+        arriveAndVerify(dispatchId, "STORE-QR-3", "DEV-003");
+        postJson("/api/weighings", "DRIVER", "driver-1", """
+                {"dispatchId": %d, "barrelCode": "BAR-202", "weightKg": 100, "deviceCode": "DEV-003",
+                 "source": "DEVICE", "handoverName": "刘老板"}
+                """.formatted(dispatchId), 200);
+        // 封桶后到厂封条破损 → 运输环节被打开过
+        postJson("/api/dispatches/" + dispatchId + "/seals", "DRIVER", "driver-1", """
+                {"barrelCode": "BAR-202", "sealNo": "SEAL-202-A"}
+                """, 200);
+        postJson("/api/dispatches/" + dispatchId + "/load-complete", "DRIVER", "driver-1", "{}", 200);
+        uploadTracksAndArrivePlant(dispatchId);
+        long manifestId = manifestIdOf(dispatchId);
+
+        postJson("/api/receipts", "PLANT", "plant-1", """
+                {"manifestId": %d, "arrivalWeightKg": 100, "barrelCount": 1,
+                 "qualityCheck": "CONTAMINATED", "sealCheck": "BROKEN", "decision": "REJECT",
+                 "rejectReason": "封条破损，桶内混入厨余", "receivedBy": "厂验收员"}
+                """.formatted(manifestId), 200);
+
+        JsonNode caseResp = getJson("/api/rejections/by-manifest/" + manifestId, "REGULATOR", 200);
+        long caseId = caseResp.path("data").path("rejectionCase").path("id").asLong();
+        assertThat(caseResp.path("data").path("rejectionCase").path("suggestedLiability").asText())
+                .isEqualTo("TRANSPORT");
+
+        // 定责运输中污染：额外费用由司机与车队承担
+        JsonNode determined = postJson("/api/rejections/" + caseId + "/determine", "RECYCLER", "recycler-1", """
+                {"liabilityParty": "TRANSPORT", "note": "到厂封条破损，判定运输途中被开封污染",
+                 "extraFeeAmount": 300}
+                """, 200);
+        assertThat(determined.path("data").path("feeBearer").asText()).isEqualTo("FLEET");
+
+        JsonNode fees = getJson("/api/settlements/fees?manifestId=" + manifestId, "RECYCLER", 200);
+        JsonNode fee = fees.path("data").get(0);
+        assertThat(fee.path("bearer").asText()).isEqualTo("FLEET");
+        assertThat(fee.path("bearerDriverId").asLong()).isEqualTo(1);
+        assertThat(fee.path("bearerVehicleId").asLong()).isEqualTo(1);
+        assertThat(fee.path("sourceNote").asText()).contains("运输途中污染");
+
+        // 无需返运直接结案；结案后不能重复定责
+        postJson("/api/rejections/" + caseId + "/close", "RECYCLER", "recycler-1", "{}", 200);
+        postJson("/api/rejections/" + caseId + "/determine", "RECYCLER", "recycler-1", """
+                {"liabilityParty": "TRANSPORT", "note": "重复定责"}
+                """, 409);
     }
 
     // ---------- 校验与鉴权 ----------
