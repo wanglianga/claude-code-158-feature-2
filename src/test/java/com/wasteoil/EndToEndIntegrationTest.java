@@ -123,6 +123,14 @@ class EndToEndIntegrationTest {
                 note == null ? "null" : "\"" + note + "\""), 200);
     }
 
+    /** 司机对已称重油桶加封一次性封条 */
+    private void seal(long dispatchId, String barrelCode, String sealCode) throws Exception {
+        postJson("/api/dispatches/" + dispatchId + "/seals", "DRIVER", "driver-1", """
+                {"barrelCode": "%s", "sealCode": "%s",
+                 "photoUrl": "https://img.example.com/seal-%s.jpg", "note": "装车后加封"}
+                """.formatted(barrelCode, sealCode, sealCode), 200);
+    }
+
     private void uploadTracksAndArrivePlant(long dispatchId) throws Exception {
         postJson("/api/tracks/" + dispatchId, "DRIVER", "driver-1", """
                 {"points": [{"lat": 30.66, "lng": 104.06, "recordedAt": "%s"},
@@ -317,7 +325,8 @@ class EndToEndIntegrationTest {
         postJson("/api/receipts", "PLANT", "plant-1", """
                 {"manifestId": %d, "arrivalWeightKg": 100, "barrelCount": 1,
                  "qualityCheck": "CONTAMINATED", "decision": "REJECT",
-                 "rejectReason": "油桶混入大量厨余垃圾，拒绝接收", "receivedBy": "厂验收员"}
+                 "rejectReason": "油桶混入大量厨余垃圾，拒绝接收",
+                 "sealIntact": false, "sealNote": "未加封封条", "receivedBy": "厂验收员"}
                 """.formatted(manifestId), 200);
 
         JsonNode manifest = getJson("/api/manifests/" + manifestId, "REGULATOR", 200);
@@ -331,6 +340,161 @@ class EndToEndIntegrationTest {
             }
         }
         assertThat(hasReject).isTrue();
+    }
+
+    /** 商户源头混入：逐桶封桶、到厂封条完好 → 建议商户责任 → 认定商户承担处理费 → 返运 → 二次处理闭环 */
+    @Test
+    @Order(14)
+    void 拒收责任_商户源头混入_返运二次处理_结算明确费用来源() throws Exception {
+        postJson("/api/weighings/devices/DEV-002/heartbeat", "RECYCLER", "recycler-1", "{}", 200);
+        long appointmentId = createAppointment(2, 1, "100");
+        long dispatchId = planDispatch(appointmentId, tomorrowAt(10, 0), tomorrowAt(11, 0));
+        arriveAndVerify(dispatchId, "STORE-QR-2", "DEV-002");
+        postJson("/api/weighings", "DRIVER", "driver-1", """
+                {"dispatchId": %d, "barrelCode": "BAR-103", "weightKg": 100, "deviceCode": "DEV-002",
+                 "source": "DEVICE", "photoUrl": "https://img.example.com/w103.jpg", "handoverName": "陈店长"}
+                """.formatted(dispatchId), 200);
+        // 司机称重后加封封条
+        seal(dispatchId, "BAR-103", "SEAL-M-0001");
+        postJson("/api/dispatches/" + dispatchId + "/load-complete", "DRIVER", "driver-1", "{}", 200);
+        uploadTracksAndArrivePlant(dispatchId);
+        long manifestId = manifestIdOf(dispatchId);
+
+        // 处置厂拒收：封条完好但混入大量厨余残渣
+        postJson("/api/receipts", "PLANT", "plant-1", """
+                {"manifestId": %d, "arrivalWeightKg": 100, "barrelCount": 1,
+                 "qualityCheck": "CONTAMINATED", "decision": "REJECT",
+                 "rejectReason": "油桶混入大量厨余残渣，拒绝接收",
+                 "sealIntact": true, "sealNote": "封条 SEAL-M-0001 完好", "receivedBy": "厂验收员"}
+                """.formatted(manifestId), 200);
+
+        // 责任调查：证据快照齐全，系统建议商户源头
+        JsonNode inv = getJson("/api/rejects/by-manifest/" + manifestId, "REGULATOR", 200);
+        JsonNode invData = inv.path("data");
+        assertThat(invData.path("status").asText()).isEqualTo("OPEN");
+        assertThat(invData.path("allSealed").asBoolean()).isTrue();
+        assertThat(invData.path("sealedBarrelCount").asInt()).isEqualTo(1);
+        assertThat(invData.path("sealIntactAtPlant").asBoolean()).isTrue();
+        assertThat(invData.path("handoverPhotoCount").asInt()).isEqualTo(1);
+        assertThat(invData.path("weighingPhotoCount").asInt()).isEqualTo(1);
+        assertThat(invData.path("suggestedLiability").asText()).isEqualTo("MERCHANT_SOURCE");
+
+        // 回收公司认定商户承担 300 元额外处理费
+        JsonNode confirmed = postJson("/api/rejects/by-manifest/" + manifestId + "/confirm",
+                "RECYCLER", "recycler-1", """
+                {"liabilityParty": "MERCHANT", "extraFee": 300,
+                 "feeSource": "商户源头混入厨余残渣的分拣及无害化处理费"}
+                """, 200);
+        assertThat(confirmed.path("data").path("liabilityParty").asText()).isEqualTo("MERCHANT");
+        assertThat(confirmed.path("data").path("feePayer").asText()).isEqualTo("MERCHANT");
+        assertThat(confirmed.path("data").path("feeSource").asText()).contains("分拣");
+
+        // 结算单：拒收费用单，金额 0（无收购款），额外费用 300 元，费用来源明确
+        JsonNode settlement = getJson("/api/settlements/by-manifest/" + manifestId, "MERCHANT", 200);
+        JsonNode sData = settlement.path("data");
+        assertThat(sData.path("billType").asText()).isEqualTo("REJECT_FEE");
+        assertThat(sData.path("amount").asDouble()).isEqualTo(0.0);
+        assertThat(sData.path("extraFee").asDouble()).isEqualTo(300.0);
+        assertThat(sData.path("feePayer").asText()).isEqualTo("MERCHANT");
+        assertThat(sData.path("feeSource").asText()).isNotBlank();
+
+        // 返运离厂：记录返运路线
+        JsonNode ret = postJson("/api/rejects/by-manifest/" + manifestId + "/return",
+                "RECYCLER", "recycler-1", """
+                {"returnRoute": "绿源废油处置厂 → 城东回收公司分拣暂存点",
+                 "vehicleId": 2, "driverId": 2, "returnedBy": "李师傅"}
+                """, 200);
+        assertThat(ret.path("data").path("status").asText()).isEqualTo("DEPARTED");
+
+        // 到达临时存放点
+        JsonNode storage = postJson("/api/rejects/by-manifest/" + manifestId + "/storage",
+                "RECYCLER", "recycler-1", """
+                {"storagePoint": "城东回收公司分拣暂存点 3 号位",
+                 "storagePhotoUrl": "https://img.example.com/storage-m.jpg"}
+                """, 200);
+        assertThat(storage.path("data").path("status").asText()).isEqualTo("IN_STORAGE");
+        assertThat(storage.path("data").path("storagePoint").asText()).contains("暂存点");
+
+        // 二次处理：分拣后合规接收 92kg，联单闭环
+        JsonNode reprocessed = postJson("/api/rejects/by-manifest/" + manifestId + "/reprocess",
+                "RECYCLER", "recycler-1", """
+                {"result": "RE_ACCEPTED", "reprocessWeightKg": 92,
+                 "note": "人工分拣剔除厨余残渣 8kg，废油复检合格后合规接收"}
+                """, 200);
+        assertThat(reprocessed.path("data").path("status").asText()).isEqualTo("REPROCESSED");
+
+        JsonNode closed = getJson("/api/manifests/" + manifestId, "REGULATOR", 200);
+        assertThat(closed.path("data").path("manifest").path("status").asText()).isEqualTo("CLOSED");
+        assertThat(closed.path("data").path("rejectInvestigation").path("liabilityParty").asText())
+                .isEqualTo("MERCHANT");
+        assertThat(closed.path("data").path("rejectReturn").path("reprocessResult").asText())
+                .isEqualTo("RE_ACCEPTED");
+    }
+
+    /** 运输污染：封条破损 + 运输异常停留 → 建议司机车队责任 → 认定车队承担，无需返运直接闭环 */
+    @Test
+    @Order(15)
+    void 拒收责任_运输污染_车队承担费用_无需返运闭环() throws Exception {
+        postJson("/api/weighings/devices/DEV-002/heartbeat", "RECYCLER", "recycler-1", "{}", 200);
+        long appointmentId = createAppointment(2, 1, "100");
+        long dispatchId = planDispatch(appointmentId, tomorrowAt(10, 0), tomorrowAt(11, 0));
+        arriveAndVerify(dispatchId, "STORE-QR-2", "DEV-002");
+        postJson("/api/weighings", "DRIVER", "driver-1", """
+                {"dispatchId": %d, "barrelCode": "BAR-104", "weightKg": 100, "deviceCode": "DEV-002",
+                 "source": "DEVICE", "photoUrl": "https://img.example.com/w104.jpg", "handoverName": "陈店长"}
+                """.formatted(dispatchId), 200);
+        seal(dispatchId, "BAR-104", "SEAL-T-0001");
+        postJson("/api/dispatches/" + dispatchId + "/load-complete", "DRIVER", "driver-1", "{}", 200);
+        // 运输轨迹：途中停留 30 分钟且几乎未移动（异常停留）
+        postJson("/api/tracks/" + dispatchId, "DRIVER", "driver-1", """
+                {"points": [{"lat": 30.66, "lng": 104.06, "recordedAt": "%s"},
+                            {"lat": 30.6602, "lng": 104.0602, "recordedAt": "%s"},
+                            {"lat": 30.60, "lng": 104.10, "recordedAt": "%s"}]}
+                """.formatted(Instant.now().minusSeconds(3600),
+                Instant.now().minusSeconds(1800), Instant.now()), 200);
+        postJson("/api/dispatches/" + dispatchId + "/arrive-plant", "DRIVER", "driver-1", "{}", 200);
+        long manifestId = manifestIdOf(dispatchId);
+
+        // 处置厂拒收：封条破损
+        postJson("/api/receipts", "PLANT", "plant-1", """
+                {"manifestId": %d, "arrivalWeightKg": 100, "barrelCount": 1,
+                 "qualityCheck": "CONTAMINATED", "decision": "REJECT",
+                 "rejectReason": "封条破损，油桶混入厨余残渣，拒绝接收",
+                 "sealIntact": false, "sealNote": "封条 SEAL-T-0001 断裂", "receivedBy": "厂验收员"}
+                """.formatted(manifestId), 200);
+
+        JsonNode inv = getJson("/api/rejects/by-manifest/" + manifestId, "REGULATOR", 200);
+        JsonNode invData = inv.path("data");
+        assertThat(invData.path("suggestedLiability").asText()).isEqualTo("TRANSPORT_CONTAMINATION");
+        assertThat(invData.path("abnormalStopCount").asInt()).isEqualTo(1);
+        assertThat(invData.path("abnormalStopDetail").asText()).contains("停留");
+
+        // 认定司机车队承担 260 元，厂内移交无害化处理、无需返运
+        postJson("/api/rejects/by-manifest/" + manifestId + "/confirm",
+                "RECYCLER", "recycler-1", """
+                {"liabilityParty": "DRIVER_FLEET", "extraFee": 260,
+                 "feeSource": "运输途中封条破损导致污染的无害化处理费", "noReturnRequired": true}
+                """, 200);
+
+        JsonNode settlement = getJson("/api/settlements/by-manifest/" + manifestId, "REGULATOR", 200);
+        assertThat(settlement.path("data").path("billType").asText()).isEqualTo("REJECT_FEE");
+        assertThat(settlement.path("data").path("extraFee").asDouble()).isEqualTo(260.0);
+        assertThat(settlement.path("data").path("feePayer").asText()).isEqualTo("DRIVER_FLEET");
+
+        // 无需返运：认定后联单直接闭环，不存在返运记录
+        JsonNode closed = getJson("/api/manifests/" + manifestId, "REGULATOR", 200);
+        assertThat(closed.path("data").path("manifest").path("status").asText()).isEqualTo("CLOSED");
+        assertThat(closed.path("data").path("rejectReturn").isNull()).isTrue();
+
+        JsonNode tickets = getJson("/api/exceptions/by-ref?refType=MANIFEST&refId=" + manifestId,
+                "REGULATOR", 200);
+        boolean hasTransportLiability = false;
+        for (JsonNode t : tickets.path("data")) {
+            if ("REJECT_LIABILITY_TRANSPORT".equals(t.path("type").asText())) {
+                hasTransportLiability = true;
+            }
+        }
+        assertThat(hasTransportLiability).isTrue();
     }
 
     @Test

@@ -114,6 +114,8 @@ public class ReportService {
 
     /**
      * 商户回收证明：期间内的合规联单清单与合计，作为回收凭证与结算依据。
+     * 拒收批次（结算单为 REJECT_FEE）不属于合规收购，即使返运二次处理后联单闭环，
+     * 也不计入回收证明的重量与金额。
      */
     @Transactional(readOnly = true)
     public RecyclingCertificate certificate(Long storeId, Instant from, Instant to) {
@@ -123,23 +125,28 @@ public class ReportService {
                         || m.getStatus() == ManifestStatus.VERIFIED
                         || m.getStatus() == ManifestStatus.DISPUTED)
                 .toList();
-        BigDecimal totalWeight = manifests.stream()
-                .map(m -> m.getArrivalWeightKg() == null ? BigDecimal.ZERO : m.getArrivalWeightKg())
-                .reduce(BigDecimal.ZERO, BigDecimal::add);
-        int totalBarrels = manifests.stream()
-                .mapToInt(m -> m.getBarrelCountArrival() == null ? 0 : m.getBarrelCountArrival())
-                .sum();
+        BigDecimal totalWeight = BigDecimal.ZERO;
+        int totalBarrels = 0;
         BigDecimal totalAmount = BigDecimal.ZERO;
         List<CertificateItem> items = new ArrayList<>();
         for (Manifest m : manifests) {
             Settlement s = settlementRepository.findByManifestId(m.getId()).orElse(null);
+            if (s != null && "REJECT_FEE".equals(s.getBillType())) {
+                continue; // 拒收费用单：废油未按收购流程合规接收，不出具回收量
+            }
+            BigDecimal weight = m.getArrivalWeightKg() == null
+                    ? BigDecimal.ZERO : m.getArrivalWeightKg();
+            totalWeight = totalWeight.add(weight);
+            if (m.getBarrelCountArrival() != null) {
+                totalBarrels += m.getBarrelCountArrival();
+            }
             BigDecimal amount = s == null ? BigDecimal.ZERO : s.getAmount();
             totalAmount = totalAmount.add(amount);
             items.add(new CertificateItem(m.getManifestNo(), m.getStatus().name(),
                     m.getArrivalWeightKg(), m.getBarrelCountArrival(),
                     m.getComplianceResult(), amount));
         }
-        return new RecyclingCertificate(storeId, from, to, manifests.size(),
+        return new RecyclingCertificate(storeId, from, to, items.size(),
                 totalBarrels, totalWeight, totalAmount, items);
     }
 

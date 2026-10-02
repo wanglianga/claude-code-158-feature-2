@@ -33,4 +33,10 @@ public class WasteOilProperties {
 
     /** 产量/预期比值阈值 */
     private BigDecimal riskYieldRatio = new BigDecimal("0.3");
+
+    /** 拒收责任判定：相邻轨迹点时间间隔超过该分钟数且位移很小，计为一次异常停留 */
+    private int abnormalStopMinutes = 20;
+
+    /** 拒收责任判定：异常停留的位移半径（米） */
+    private int abnormalStopRadiusMeters = 500;
 }

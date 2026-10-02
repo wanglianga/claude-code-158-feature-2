@@ -52,3 +52,7 @@ wasteoil:
   risk-window-days: 90
   # 产量/预期比值低于该值进入风险名单
   risk-yield-ratio: 0.3
+  # 拒收责任判定：相邻轨迹点间隔超过该分钟数且未发生明显位移，计为运输途中异常停留
+  abnormal-stop-minutes: 20
+  # 异常停留位移半径（米）
+  abnormal-stop-radius-meters: 500

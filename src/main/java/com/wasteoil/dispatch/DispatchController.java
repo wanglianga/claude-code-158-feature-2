@@ -1,5 +1,6 @@
 package com.wasteoil.dispatch;
 
+import com.wasteoil.barrel.BarrelSealRecord;
 import com.wasteoil.common.ApiResult;
 import com.wasteoil.common.ActorRole;
 import com.wasteoil.common.AuthContext;
@@ -59,6 +60,15 @@ public class DispatchController {
         return ApiResult.ok(dispatchService.loadComplete(id));
     }
 
+    /** 装车称重后逐桶加封一次性封条（封桶记录是拒收责任判定依据） */
+    @PostMapping("/{id}/seals")
+    public ApiResult<BarrelSealRecord> seal(@PathVariable Long id,
+                                            @Valid @RequestBody SealRequest req) {
+        AuthContext.require(ActorRole.DRIVER, ActorRole.RECYCLER);
+        return ApiResult.ok(dispatchService.seal(id, req.barrelCode(), req.sealCode(),
+                req.photoUrl(), req.note()));
+    }
+
     /** 到达处置厂 */
     @PostMapping("/{id}/arrive-plant")
     public ApiResult<DispatchOrder> arrivePlant(@PathVariable Long id) {
@@ -91,5 +101,12 @@ public class DispatchController {
             String deviceCode,
             @NotBlank(message = "交接人不能为空") String handoverName,
             String photoUrls) {
+    }
+
+    public record SealRequest(
+            @NotBlank(message = "油桶编号不能为空") String barrelCode,
+            @NotBlank(message = "封条编号不能为空") String sealCode,
+            String photoUrl,
+            String note) {
     }
 }

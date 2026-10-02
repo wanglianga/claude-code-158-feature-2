@@ -18,6 +18,10 @@ public enum ExceptionType {
     TRACK_MISSING(true),
     /** 处置厂拒收 */
     PLANT_REJECT(false),
+    /** 拒收责任认定为商户源头混入（产生商户额外处理费） */
+    REJECT_LIABILITY_MERCHANT(false),
+    /** 拒收责任认定为运输途中污染（司机和车队承担责任） */
+    REJECT_LIABILITY_TRANSPORT(false),
     /** 商户质疑重量 */
     WEIGHT_DISPUTE(false),
     /** 监管抽查 */

@@ -19,13 +19,13 @@ public class PlantController {
         this.plantService = plantService;
     }
 
-    /** 处置厂收料：二次称重 + 质检 + 接收/拒收 */
+    /** 处置厂收料：二次称重 + 质检 + 接收/拒收（拒收须核验封条是否完好） */
     @PostMapping
     public ApiResult<PlantReceipt> receive(@Valid @RequestBody ReceiptRequest req) {
         AuthContext.require(ActorRole.PLANT);
         return ApiResult.ok(plantService.receive(req.manifestId(), req.arrivalWeightKg(),
                 req.barrelCount(), req.qualityCheck(), req.decision(),
-                req.rejectReason(), req.receivedBy()));
+                req.rejectReason(), req.sealIntact(), req.sealNote(), req.receivedBy()));
     }
 
     @GetMapping("/by-manifest/{manifestId}")
@@ -43,6 +43,10 @@ public class PlantController {
             @NotBlank(message = "接收决定不能为空")
             @Pattern(regexp = "ACCEPT|REJECT", message = "接收决定只能是 ACCEPT 或 REJECT") String decision,
             String rejectReason,
+            /** 到厂封条是否完好（拒收时必检） */
+            Boolean sealIntact,
+            /** 封条异常说明（破损/缺失封条编号等） */
+            String sealNote,
             @NotBlank(message = "收料人不能为空") String receivedBy) {
     }
 }

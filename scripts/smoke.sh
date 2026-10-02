@@ -109,10 +109,74 @@ MID4=$(curl -s "$BASE/api/manifests" -H "X-Role: REGULATOR" | python3 -c "
 import sys,json
 for m in json.load(sys.stdin)['data']:
     if m['dispatchId']==$DID4: print(m['id']); break")
-req POST /api/receipts PLANT plant-1 "{\"manifestId\":$MID4,\"arrivalWeightKg\":100,\"barrelCount\":1,\"qualityCheck\":\"CONTAMINATED\",\"decision\":\"REJECT\",\"rejectReason\":\"混入大量厨余垃圾\",\"receivedBy\":\"厂验收员\"}" >/dev/null
+req POST /api/receipts PLANT plant-1 "{\"manifestId\":$MID4,\"arrivalWeightKg\":100,\"barrelCount\":1,\"qualityCheck\":\"CONTAMINATED\",\"decision\":\"REJECT\",\"rejectReason\":\"混入大量厨余垃圾\",\"sealIntact\":false,\"sealNote\":\"未加封封条\",\"receivedBy\":\"厂验收员\"}" >/dev/null
 check "联单 REJECTED" "$(jget "['data']['manifest']['status']" <<< "$(req GET /api/manifests/$MID4 REGULATOR regulator-1)")" "REJECTED"
+check "拒收自动发起责任调查" "$(jget "['data']['status']" <<< "$(req GET /api/rejects/by-manifest/$MID4 REGULATOR regulator-1)")" "OPEN"
+check "未全封桶且无运输异常_建议无法自动判定" "$(jget "['data']['suggestedLiability']" <<< "$(req GET /api/rejects/by-manifest/$MID4 REGULATOR regulator-1)")" "INCONCLUSIVE"
 
-echo "=== 7. 运输损耗异常 → 阻断闭环 → 处理后恢复 ==="
+echo "=== 7. 拒收责任（商户源头）：封桶→封条完好→商户担费→返运→二次处理闭环 ==="
+AID6=$(jget "['data']['id']" <<< "$(req POST /api/appointments MERCHANT merchant-1 "{\"storeId\":2,\"barrelCount\":1,\"estimatedWeightKg\":100,\"windowStart\":\"$WS\",\"windowEnd\":\"$WE\"}")")
+DID6=$(jget "['data']['id']" <<< "$(req POST /api/dispatches RECYCLER recycler-1 "{\"appointmentId\":$AID6,\"vehicleId\":1,\"driverId\":1,\"plantId\":1,\"plannedStart\":\"$WS\",\"plannedEnd\":\"$WE\"}")")
+req POST /api/dispatches/$DID6/depart DRIVER driver-1 '{}' >/dev/null
+req POST /api/dispatches/$DID6/arrive DRIVER driver-1 '{}' >/dev/null
+req POST /api/dispatches/$DID6/verify DRIVER driver-1 '{"storeQr":"STORE-QR-2","deviceCode":"DEV-002","handoverName":"陈店长","photoUrls":"https://img.example.com/handover-m.jpg"}' >/dev/null
+req POST /api/weighings DRIVER driver-1 "{\"dispatchId\":$DID6,\"barrelCode\":\"BAR-103\",\"weightKg\":100,\"deviceCode\":\"DEV-002\",\"source\":\"DEVICE\",\"photoUrl\":\"https://img.example.com/w103.jpg\"}" >/dev/null
+req POST /api/dispatches/$DID6/seals DRIVER driver-1 '{"barrelCode":"BAR-103","sealCode":"SEAL-SMOKE-M1","photoUrl":"https://img.example.com/seal-m1.jpg","note":"装车后加封"}' >/dev/null
+check "封桶后油桶状态 SEALED" "$(jget "['data']['barrel']['status']" <<< "$(req GET /api/barrels/BAR-103/trace REGULATOR regulator-1)")" "SEALED"
+req POST /api/dispatches/$DID6/load-complete DRIVER driver-1 '{}' >/dev/null
+req POST /api/tracks/$DID6 DRIVER driver-1 '{"points":[{"lat":30.65,"lng":104.05},{"lat":30.62,"lng":104.08}]}' >/dev/null
+req POST /api/dispatches/$DID6/arrive-plant DRIVER driver-1 '{}' >/dev/null
+MID6=$(curl -s "$BASE/api/manifests" -H "X-Role: REGULATOR" | python3 -c "
+import sys,json
+for m in json.load(sys.stdin)['data']:
+    if m['dispatchId']==$DID6: print(m['id']); break")
+req POST /api/receipts PLANT plant-1 "{\"manifestId\":$MID6,\"arrivalWeightKg\":100,\"barrelCount\":1,\"qualityCheck\":\"CONTAMINATED\",\"decision\":\"REJECT\",\"rejectReason\":\"油桶混入大量厨余残渣\",\"sealIntact\":true,\"sealNote\":\"封条 SEAL-SMOKE-M1 完好\",\"receivedBy\":\"厂验收员\"}" >/dev/null
+INV6=$(req GET /api/rejects/by-manifest/$MID6 REGULATOR regulator-1)
+check "全部封桶且封条完好_建议商户源头" "$(jget "['data']['suggestedLiability']" <<< "$INV6")" "MERCHANT_SOURCE"
+check "证据快照_交接照片 1 张" "$(jget "['data']['handoverPhotoCount']" <<< "$INV6")" "1"
+check "证据快照_称重照片 1 张" "$(jget "['data']['weighingPhotoCount']" <<< "$INV6")" "1"
+req POST /api/rejects/by-manifest/$MID6/confirm RECYCLER recycler-1 '{"liabilityParty":"MERCHANT","extraFee":300,"feeSource":"商户源头混入厨余残渣的分拣及无害化处理费"}' >/dev/null
+check "认定责任方 MERCHANT" "$(jget "['data']['liabilityParty']" <<< "$(req GET /api/rejects/by-manifest/$MID6 REGULATOR regulator-1)")" "MERCHANT"
+SET6=$(req GET /api/settlements/by-manifest/$MID6 MERCHANT merchant-1)
+check "结算单类型 REJECT_FEE" "$(jget "['data']['billType']" <<< "$SET6")" "REJECT_FEE"
+check "拒收单收购金额 0 元" "$(jget "['data']['amount']" <<< "$SET6")" "0.0"
+check "商户承担额外处理费 300 元" "$(jget "['data']['extraFee']" <<< "$SET6")" "300.0"
+check "费用承担方 MERCHANT" "$(jget "['data']['feePayer']" <<< "$SET6")" "MERCHANT"
+check "费用来源已明确" "$(python3 -c "import sys,json;print(len(json.load(sys.stdin)['data']['feeSource'])>0)" <<< "$SET6")" "True"
+req POST /api/rejects/by-manifest/$MID6/return RECYCLER recycler-1 '{"returnRoute":"绿源处置厂 → 城东分拣暂存点","vehicleId":2,"driverId":2,"returnedBy":"李师傅"}' >/dev/null
+check "返运批次到达临时存放点 IN_STORAGE" "$(jget "['data']['status']" <<< "$(req POST /api/rejects/by-manifest/$MID6/storage RECYCLER recycler-1 '{"storagePoint":"城东分拣暂存点3号位","storagePhotoUrl":"https://img.example.com/storage.jpg"}')")" "IN_STORAGE"
+check "返运记录含临时存放点" "$(jget "['data']['storagePoint']" <<< "$(req GET /api/rejects/by-manifest/$MID6/return REGULATOR regulator-1)")" "城东分拣暂存点3号位"
+req POST /api/rejects/by-manifest/$MID6/reprocess RECYCLER recycler-1 '{"result":"RE_ACCEPTED","reprocessWeightKg":92,"note":"分拣剔除厨余8kg后复检合格接收"}' >/dev/null
+check "二次处理后联单 CLOSED" "$(jget "['data']['manifest']['status']" <<< "$(req GET /api/manifests/$MID6 REGULATOR regulator-1)")" "CLOSED"
+check "二次处理结果 RE_ACCEPTED" "$(jget "['data']['rejectReturn']['reprocessResult']" <<< "$(req GET /api/manifests/$MID6 REGULATOR regulator-1)")" "RE_ACCEPTED"
+
+echo "=== 8. 拒收责任（运输污染）：封条破损+异常停留→车队担费→无需返运闭环 ==="
+AID7=$(jget "['data']['id']" <<< "$(req POST /api/appointments MERCHANT merchant-1 "{\"storeId\":2,\"barrelCount\":1,\"estimatedWeightKg\":100,\"windowStart\":\"$WS\",\"windowEnd\":\"$WE\"}")")
+DID7=$(jget "['data']['id']" <<< "$(req POST /api/dispatches RECYCLER recycler-1 "{\"appointmentId\":$AID7,\"vehicleId\":1,\"driverId\":1,\"plantId\":1,\"plannedStart\":\"$WS\",\"plannedEnd\":\"$WE\"}")")
+req POST /api/dispatches/$DID7/depart DRIVER driver-1 '{}' >/dev/null
+req POST /api/dispatches/$DID7/arrive DRIVER driver-1 '{}' >/dev/null
+req POST /api/dispatches/$DID7/verify DRIVER driver-1 '{"storeQr":"STORE-QR-2","deviceCode":"DEV-002","handoverName":"陈店长"}' >/dev/null
+req POST /api/weighings DRIVER driver-1 "{\"dispatchId\":$DID7,\"barrelCode\":\"BAR-104\",\"weightKg\":100,\"deviceCode\":\"DEV-002\",\"source\":\"DEVICE\",\"photoUrl\":\"https://img.example.com/w104.jpg\"}" >/dev/null
+req POST /api/dispatches/$DID7/seals DRIVER driver-1 '{"barrelCode":"BAR-104","sealCode":"SEAL-SMOKE-T1"}' >/dev/null
+req POST /api/dispatches/$DID7/load-complete DRIVER driver-1 '{}' >/dev/null
+T0=$(date -u -d '60 minutes ago' +%Y-%m-%dT%H:%M:%SZ); T1=$(date -u -d '30 minutes ago' +%Y-%m-%dT%H:%M:%SZ); T2=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+req POST /api/tracks/$DID7 DRIVER driver-1 "{\"points\":[{\"lat\":30.66,\"lng\":104.06,\"recordedAt\":\"$T0\"},{\"lat\":30.6602,\"lng\":104.0602,\"recordedAt\":\"$T1\"},{\"lat\":30.60,\"lng\":104.10,\"recordedAt\":\"$T2\"}]}" >/dev/null
+req POST /api/dispatches/$DID7/arrive-plant DRIVER driver-1 '{}' >/dev/null
+MID7=$(curl -s "$BASE/api/manifests" -H "X-Role: REGULATOR" | python3 -c "
+import sys,json
+for m in json.load(sys.stdin)['data']:
+    if m['dispatchId']==$DID7: print(m['id']); break")
+req POST /api/receipts PLANT plant-1 "{\"manifestId\":$MID7,\"arrivalWeightKg\":100,\"barrelCount\":1,\"qualityCheck\":\"CONTAMINATED\",\"decision\":\"REJECT\",\"rejectReason\":\"封条破损，混入厨余残渣\",\"sealIntact\":false,\"sealNote\":\"封条 SEAL-SMOKE-T1 断裂\",\"receivedBy\":\"厂验收员\"}" >/dev/null
+INV7=$(req GET /api/rejects/by-manifest/$MID7 REGULATOR regulator-1)
+check "封条破损_建议运输污染" "$(jget "['data']['suggestedLiability']" <<< "$INV7")" "TRANSPORT_CONTAMINATION"
+check "识别异常停留 1 次" "$(jget "['data']['abnormalStopCount']" <<< "$INV7")" "1"
+req POST /api/rejects/by-manifest/$MID7/confirm RECYCLER recycler-1 '{"liabilityParty":"DRIVER_FLEET","extraFee":260,"feeSource":"运输途中封条破损导致污染的无害化处理费","noReturnRequired":true}' >/dev/null
+SET7=$(req GET /api/settlements/by-manifest/$MID7 REGULATOR regulator-1)
+check "车队承担额外处理费 260 元" "$(jget "['data']['extraFee']" <<< "$SET7")" "260.0"
+check "费用承担方 DRIVER_FLEET" "$(jget "['data']['feePayer']" <<< "$SET7")" "DRIVER_FLEET"
+check "无需返运_认定后联单 CLOSED" "$(jget "['data']['manifest']['status']" <<< "$(req GET /api/manifests/$MID7 REGULATOR regulator-1)")" "CLOSED"
+
+echo "=== 9. 运输损耗异常 → 阻断闭环 → 处理后恢复 ==="
 AID5=$(jget "['data']['id']" <<< "$(req POST /api/appointments MERCHANT merchant-1 "{\"storeId\":2,\"barrelCount\":1,\"estimatedWeightKg\":100,\"windowStart\":\"$WS\",\"windowEnd\":\"$WE\"}")")
 DID5=$(jget "['data']['id']" <<< "$(req POST /api/dispatches RECYCLER recycler-1 "{\"appointmentId\":$AID5,\"vehicleId\":1,\"driverId\":1,\"plantId\":1,\"plannedStart\":\"$WS\",\"plannedEnd\":\"$WE\"}")")
 req POST /api/dispatches/$DID5/depart DRIVER driver-1 '{}' >/dev/null
@@ -135,7 +199,7 @@ for t in json.load(sys.stdin)['data']:
 req POST /api/exceptions/$TID/resolve RECYCLER recycler-1 '{"resolution":"确认为阀门渗漏，已维修备案"}' >/dev/null
 check "工单处理后备联单 CLOSED" "$(jget "['data']['manifest']['status']" <<< "$(req GET /api/manifests/$MID5 REGULATOR regulator-1)")" "CLOSED"
 
-echo "=== 8. 监管抽查 + 风险名单 + 报表 ==="
+echo "=== 10. 监管抽查 + 风险名单 + 报表 ==="
 req POST /api/inspections REGULATOR regulator-1 "{\"manifestId\":$MID,\"result\":\"PASS\",\"note\":\"抽查合格\"}" >/dev/null
 req POST /api/risks/scan REGULATOR regulator-1 '{}' >/dev/null
 RISKS=$(req GET /api/risks REGULATOR regulator-1)
@@ -147,9 +211,11 @@ check "商户回收证明联单数≥1" "$(python3 -c "import sys,json;print(jso
 TREND=$(req GET /api/reports/regulator/trend REGULATOR regulator-1)
 check "监管趋势报表" "$(python3 -c "import sys,json;print(len(json.load(sys.stdin)['data'])>0)" <<< "$TREND")" "True"
 
-echo "=== 9. Kafka 事件审计流水 ==="
+echo "=== 11. Kafka 事件审计流水 ==="
 AUDIT=$(psql "postgresql://wasteoil:wasteoil123@localhost:5433/wasteoil" -tAc "SELECT count(*) FROM audit_logs" 2>/dev/null || echo "0")
 check "审计流水已落库(>20 条)" "$(python3 -c "print($AUDIT>20)")" "True"
+REJECT_EVENTS=$(psql "postgresql://wasteoil:wasteoil123@localhost:5433/wasteoil" -tAc "SELECT count(*) FROM audit_logs WHERE topic='wasteoil.reject.events'" 2>/dev/null || echo "0")
+check "拒收责任事件已入审计流水(>0 条)" "$(python3 -c "print($REJECT_EVENTS>0)")" "True"
 
 echo ""
 echo "=========================================="

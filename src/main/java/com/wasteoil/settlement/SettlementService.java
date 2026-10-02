@@ -68,6 +68,35 @@ public class SettlementService {
         return settlementRepository.save(settlement);
     }
 
+    /**
+     * 拒收责任认定后生成/更新拒收费用单：无废油收购款（金额为 0），
+     * 仅记录额外处理费用、费用承担方与费用来源，结算单上明确"钱从哪来、谁来付"，
+     * 避免处置厂、司机和商户互相推责。
+     */
+    @Transactional
+    public Settlement createRejectFeeBill(Manifest manifest, String feePayer,
+                                          BigDecimal extraFee, String feeSource,
+                                          Long investigationId) {
+        Settlement settlement = settlementRepository.findByManifestId(manifest.getId())
+                .orElseGet(() -> {
+                    Settlement s = new Settlement();
+                    s.setManifestId(manifest.getId());
+                    s.setStoreId(manifest.getStoreId());
+                    s.setWeightKg(BigDecimal.ZERO);
+                    s.setUnitPrice(properties.getUnitPricePerKg());
+                    s.setAmount(BigDecimal.ZERO);
+                    return s;
+                });
+        settlement.setBillType("REJECT_FEE");
+        settlement.setExtraFee(extraFee == null ? BigDecimal.ZERO : extraFee);
+        settlement.setFeePayer(feePayer);
+        settlement.setFeeSource(feeSource);
+        settlement.setInvestigationId(investigationId);
+        settlement.setStatus("CONFIRMED");
+        settlement.setUpdatedAt(Instant.now());
+        return settlementRepository.save(settlement);
+    }
+
     @Transactional(readOnly = true)
     public Settlement getByManifest(Long manifestId) {
         return settlementRepository.findByManifestId(manifestId)

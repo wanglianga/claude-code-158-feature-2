@@ -3,6 +3,11 @@ package com.wasteoil.dispatch;
 import com.wasteoil.appointment.Appointment;
 import com.wasteoil.appointment.AppointmentRepository;
 import com.wasteoil.appointment.AppointmentStatus;
+import com.wasteoil.barrel.Barrel;
+import com.wasteoil.barrel.BarrelRepository;
+import com.wasteoil.barrel.BarrelSealRecord;
+import com.wasteoil.barrel.BarrelSealRecordRepository;
+import com.wasteoil.barrel.BarrelStatus;
 import com.wasteoil.common.AuthContext;
 import com.wasteoil.common.BizException;
 import com.wasteoil.config.WasteOilProperties;
@@ -21,6 +26,7 @@ import com.wasteoil.plant.PlantRepository;
 import com.wasteoil.weighing.PickupVerification;
 import com.wasteoil.weighing.PickupVerificationRepository;
 import com.wasteoil.weighing.WeighingDeviceRepository;
+import com.wasteoil.weighing.WeighingRecord;
 import com.wasteoil.weighing.WeighingRecordRepository;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
@@ -51,6 +57,8 @@ public class DispatchService {
     private final WeighingRecordRepository weighingRecordRepository;
     private final WeighingDeviceRepository weighingDeviceRepository;
     private final PickupVerificationRepository verificationRepository;
+    private final BarrelRepository barrelRepository;
+    private final BarrelSealRecordRepository sealRecordRepository;
     private final DispatchPlanner planner;
     private final ExceptionService exceptionService;
     private final EventPublisher eventPublisher;
@@ -68,6 +76,8 @@ public class DispatchService {
                            WeighingRecordRepository weighingRecordRepository,
                            WeighingDeviceRepository weighingDeviceRepository,
                            PickupVerificationRepository verificationRepository,
+                           BarrelRepository barrelRepository,
+                           BarrelSealRecordRepository sealRecordRepository,
                            DispatchPlanner planner,
                            ExceptionService exceptionService,
                            EventPublisher eventPublisher,
@@ -84,6 +94,8 @@ public class DispatchService {
         this.weighingRecordRepository = weighingRecordRepository;
         this.weighingDeviceRepository = weighingDeviceRepository;
         this.verificationRepository = verificationRepository;
+        this.barrelRepository = barrelRepository;
+        this.sealRecordRepository = sealRecordRepository;
         this.planner = planner;
         this.exceptionService = exceptionService;
         this.eventPublisher = eventPublisher;
@@ -216,6 +228,52 @@ public class DispatchService {
         dispatch.setUpdatedAt(Instant.now());
         DispatchOrder saved = dispatchRepository.save(dispatch);
         publish(saved, "DispatchVerified");
+        return saved;
+    }
+
+    /**
+     * 装车称重后逐桶加封一次性封条并拍照留证。
+     * 封条是拒收责任判定的关键证据：只允许对本趟已称重装车的桶封桶，同一桶不重复加封。
+     */
+    @Transactional
+    public BarrelSealRecord seal(Long dispatchId, String barrelCode, String sealCode,
+                                 String photoUrl, String note) {
+        DispatchOrder dispatch = getAndCheckDriver(dispatchId);
+        requireStatus(dispatch, DispatchStatus.LOADING);
+        Barrel barrel = barrelRepository.findByCode(barrelCode)
+                .orElseThrow(() -> BizException.notFound("油桶: " + barrelCode));
+        List<WeighingRecord> weighed = weighingRecordRepository.findByDispatchId(dispatchId);
+        boolean weighedThisTrip = weighed.stream().anyMatch(w -> w.getBarrelId().equals(barrel.getId()));
+        if (!weighedThisTrip) {
+            throw BizException.conflict("油桶 " + barrelCode + " 本趟未称重装车，不能封桶");
+        }
+        if (sealRecordRepository.existsByDispatchIdAndBarrelId(dispatchId, barrel.getId())) {
+            throw BizException.conflict("油桶 " + barrelCode + " 本趟已加封封条，不能重复加封");
+        }
+        if (barrel.getStatus() != BarrelStatus.LOADED) {
+            throw BizException.conflict("油桶 " + barrelCode + " 状态为 " + barrel.getStatus() + "，不能封桶");
+        }
+
+        BarrelSealRecord record = new BarrelSealRecord();
+        record.setDispatchId(dispatchId);
+        record.setBarrelId(barrel.getId());
+        record.setSealCode(sealCode);
+        record.setSealedBy(AuthContext.accountId() == null ? "driver" : AuthContext.accountId());
+        record.setPhotoUrl(photoUrl);
+        record.setNote(note);
+        BarrelSealRecord saved = sealRecordRepository.save(record);
+
+        barrel.setStatus(BarrelStatus.SEALED);
+        barrel.setUpdatedAt(Instant.now());
+        barrelRepository.save(barrel);
+
+        Map<String, Object> payload = new HashMap<>();
+        payload.put("sealId", saved.getId());
+        payload.put("dispatchId", dispatchId);
+        payload.put("barrelCode", barrelCode);
+        payload.put("sealCode", sealCode);
+        eventPublisher.publish(KafkaTopics.DISPATCH_EVENTS,
+                "dispatch-" + dispatchId, "BarrelSealed", payload);
         return saved;
     }
 

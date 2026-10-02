@@ -13,6 +13,7 @@ import com.wasteoil.kafka.KafkaTopics;
 import com.wasteoil.manifest.Manifest;
 import com.wasteoil.manifest.ManifestRepository;
 import com.wasteoil.manifest.ManifestStatus;
+import com.wasteoil.reject.RejectInvestigationService;
 import com.wasteoil.weighing.WeighingRecord;
 import com.wasteoil.weighing.WeighingRecordRepository;
 import org.springframework.stereotype.Service;
@@ -37,6 +38,7 @@ public class PlantService {
     private final ComplianceService complianceService;
     private final DispatchService dispatchService;
     private final ExceptionService exceptionService;
+    private final RejectInvestigationService rejectInvestigationService;
     private final EventPublisher eventPublisher;
 
     public PlantService(PlantReceiptRepository receiptRepository,
@@ -46,6 +48,7 @@ public class PlantService {
                         ComplianceService complianceService,
                         DispatchService dispatchService,
                         ExceptionService exceptionService,
+                        RejectInvestigationService rejectInvestigationService,
                         EventPublisher eventPublisher) {
         this.receiptRepository = receiptRepository;
         this.manifestRepository = manifestRepository;
@@ -54,17 +57,19 @@ public class PlantService {
         this.complianceService = complianceService;
         this.dispatchService = dispatchService;
         this.exceptionService = exceptionService;
+        this.rejectInvestigationService = rejectInvestigationService;
         this.eventPublisher = eventPublisher;
     }
 
     /**
      * 处置厂收料：二次称重 + 质检 + 接收/拒收决定。
-     * 接收后自动执行合规闭环比对。
+     * 接收后自动执行合规闭环比对；拒收时必须核验封条是否完好，系统自动发起责任调查。
      */
     @Transactional
     public PlantReceipt receive(Long manifestId, BigDecimal arrivalWeightKg, Integer barrelCount,
                                 String qualityCheck, String decision,
-                                String rejectReason, String receivedBy) {
+                                String rejectReason, Boolean sealIntact, String sealNote,
+                                String receivedBy) {
         Manifest manifest = manifestRepository.findById(manifestId)
                 .orElseThrow(() -> BizException.notFound("电子联单"));
         if (manifest.getStatus() != ManifestStatus.IN_TRANSIT) {
@@ -77,6 +82,9 @@ public class PlantService {
         if (reject && (rejectReason == null || rejectReason.isBlank())) {
             throw BizException.badRequest("拒收必须填写原因");
         }
+        if (reject && sealIntact == null) {
+            throw BizException.badRequest("拒收必须核验并填写到厂封条是否完好（sealIntact）");
+        }
 
         PlantReceipt receipt = new PlantReceipt();
         receipt.setManifestId(manifestId);
@@ -85,19 +93,23 @@ public class PlantService {
         receipt.setQualityCheck(qualityCheck);
         receipt.setDecision(reject ? "REJECT" : "ACCEPT");
         receipt.setRejectReason(rejectReason);
+        receipt.setSealIntact(sealIntact);
+        receipt.setSealNote(sealNote);
         receipt.setReceivedBy(receivedBy);
         PlantReceipt saved = receiptRepository.save(receipt);
 
         if (reject) {
-            // 拒收：联单进入 REJECTED，登记异常由回收公司处置
+            // 拒收：联单进入 REJECTED，登记异常并自动发起责任调查（追溯照片/封桶/轨迹/检测）
             manifest.setStatus(ManifestStatus.REJECTED);
             manifest.setArrivalWeightKg(arrivalWeightKg);
             manifest.setBarrelCountArrival(barrelCount);
+            manifest.setQualityIssue(true);
             manifest.setExceptionNote("处置厂拒收: " + rejectReason);
             manifest.setUpdatedAt(Instant.now());
             manifestRepository.save(manifest);
             exceptionService.raise(ExceptionType.PLANT_REJECT, "MANIFEST", manifestId,
                     "处置厂拒收，原因: " + rejectReason);
+            rejectInvestigationService.openInvestigation(manifest, saved);
         } else {
             // 接收：油桶到厂，执行合规闭环比对
             markBarrelsAtPlant(manifest);

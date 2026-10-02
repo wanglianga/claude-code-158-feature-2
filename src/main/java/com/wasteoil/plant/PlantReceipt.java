@@ -42,6 +42,14 @@ public class PlantReceipt {
     @Column(name = "reject_reason")
     private String rejectReason;
 
+    /** 到厂时封条是否完好（拒收时由处置厂核验，作为运输环节责任判定依据） */
+    @Column(name = "seal_intact")
+    private Boolean sealIntact;
+
+    /** 封条异常说明（破损/缺失封条编号等） */
+    @Column(name = "seal_note")
+    private String sealNote;
+
     @Column(name = "received_by", nullable = false)
     private String receivedBy;
 
